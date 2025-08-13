@@ -1,0 +1,3 @@
+pyinstaller --onefile --windowed --name ezy_plugin_v1.0.0 --add-data "C:\Users\Miguel\AppData\Local\Programs\Python\Python312\Lib\site-packages\escpos\capabilities.json;escpos" --add-data "icon.png;." mi_servidor_impresion.py
+
+python -c "import os, escpos; print(os.path.join(os.path.dirname(escpos.__file__), 'capabilities.json'))"
