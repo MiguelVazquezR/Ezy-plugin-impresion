@@ -4,6 +4,7 @@ import sys
 import logging
 import threading
 import requests
+import time
 
 # Importaciones de Flask y Servidor
 from flask import Flask, jsonify, request
@@ -12,7 +13,7 @@ from waitress import serve
 
 # Importaciones de librerías de terceros
 from pystray import MenuItem, Icon
-from PIL import Image
+from PIL import Image, ImageOps
 from escpos.printer import Dummy
 
 # Importaciones de Windows
@@ -44,7 +45,7 @@ CORS(app)
 @app.route('/version', methods=['GET'])
 def get_version():
     logger.info("Solicitud de versión recibida.")
-    return jsonify({"ok": True, "version": "1.0.2"}) # Versión actualizada
+    return jsonify({"ok": True, "version": "1.1.0"}) # Versión incrementada por funcionalidad de cajón
 
 @app.route('/impresoras', methods=['GET'])
 def get_impresoras():
@@ -60,25 +61,30 @@ def get_impresoras():
 
 @app.route('/imprimir', methods=['POST'])
 def post_imprimir():
+    hPrinter = None
     try:
         carga_util = request.get_json()
         nombre_impresora = carga_util.get('nombreImpresora')
         operaciones = carga_util.get('operaciones', [])
         
-        # Ancho máximo en puntos (dots) de la impresora.
-        # 576px es el estándar para papel de 80mm.
-        # 384px es el estándar para papel de 58mm.
+        # --- LÓGICA DE ZONA SEGURA ---
         if carga_util.get('anchoImpresora') == '58mm':
-            ancho_max_impresora = 384
+            ancho_canvas = 384 # 48 bytes exactos
+            ancho_seguro_max = 300 # 300px de imagen + 42px blancos a cada lado
         else:
-            ancho_max_impresora = 576
-
+            ancho_canvas = 576 # 72 bytes exactos (80mm)
+            ancho_seguro_max = 512 # Margen estándar de seguridad para 80mm
+            
         if not nombre_impresora:
             raise ValueError("El campo 'nombreImpresora' es requerido.")
         
-        logger.info(f"Petición de impresión para '{nombre_impresora}' con {len(operaciones)} operaciones.")
+        logger.info(f"Petición para '{nombre_impresora}'. Canvas: {ancho_canvas}px, Zona Segura: {ancho_seguro_max}px")
 
-        impresora_virtual = Dummy()
+        hPrinter = win32print.OpenPrinter(nombre_impresora)
+        hJob = win32print.StartDocPrinter(hPrinter, 1, ("Ticket Plugin Flask", None, "RAW"))
+        win32print.StartPagePrinter(hPrinter)
+
+        buffer_texto = Dummy()
         
         for op in operaciones:
             nombre_op = op.get('nombre')
@@ -86,80 +92,122 @@ def post_imprimir():
             logger.info(f"Procesando operación: {nombre_op}")
 
             if nombre_op == "EscribirTexto":
-                impresora_virtual.text(args[0] if args else "")
+                buffer_texto.text(args[0] if args else "")
+            
+            elif nombre_op == "AbrirCajon":
+                # La mayoría de impresoras usan el Pin 2 (Standard).
+                # Enviamos el comando y procesamos inmediatamente para que el cajón abra YA.
+                try:
+                    # Pin 2 (Standard)
+                    buffer_texto.cashdraw(2)
+                    # Opcional: Pin 5 (algunas impresoras raras lo usan, no suele hacer daño enviar ambos)
+                    # buffer_texto.cashdraw(5) 
+                except Exception as e:
+                    logger.error(f"Error generando comando cajón: {e}")
+
             elif nombre_op == "Feed":
-                impresora_virtual.text("\n" * (int(args[0]) if args else 1))
+                buffer_texto.text("\n" * (int(args[0]) if args else 1))
+            
             elif nombre_op == "TextoSegunPaginaDeCodigos":
-                if len(args) < 3: continue
-                impresora_virtual.codepage = args[1] 
-                impresora_virtual.text(args[2])
+                if len(args) >= 3:
+                    try:
+                        buffer_texto.codepage = args[1]
+                    except:
+                        pass
+                    buffer_texto.text(args[2])
+            
             elif nombre_op == "DescargarImagenDeInternetEImprimir":
-                if not args or not args[0]:
-                    logger.warning("URL de imagen no proporcionada.")
-                    continue
-                
+                # Vaciar buffer de texto previo (incluyendo comando de cajón si lo hubiera)
+                bytes_texto = buffer_texto.output
+                if bytes_texto:
+                    win32print.WritePrinter(hPrinter, bytes_texto)
+                    buffer_texto = Dummy()
+
+                if not args or not args[0]: continue
                 url_imagen = args[0]
-                # El segundo argumento es el ancho deseado. Es opcional.
                 ancho_deseado = args[1] if len(args) > 1 and args[1] is not None else None
                 
-                logger.info(f"Descargando imagen desde: {url_imagen}")
-                
                 try:
-                    respuesta = requests.get(url_imagen, stream=True)
+                    logger.info(f"Descargando imagen: {url_imagen}")
+                    respuesta = requests.get(url_imagen, stream=True, timeout=20)
                     respuesta.raise_for_status()
                     
-                    imagen_pil = Image.open(respuesta.raw)
-                    ancho_original, alto_original = imagen_pil.size
+                    # 1. Cargar y Sanear
+                    imagen_pil = Image.open(respuesta.raw).convert("RGBA")
+                    fondo_blanco = Image.new("RGB", imagen_pil.size, (255, 255, 255))
+                    fondo_blanco.paste(imagen_pil, mask=imagen_pil.split()[3])
+                    imagen_saneada = fondo_blanco
 
-                    # Determinar el ancho objetivo inicial.
-                    # Si el usuario no especifica un ancho, el objetivo es el ancho original.
-                    ancho_objetivo = ancho_deseado if ancho_deseado is not None else ancho_original
+                    # 2. Redimensionar respetando la ZONA SEGURA
+                    ancho_original, alto_original = imagen_saneada.size
                     
-                    # El ancho final NUNCA puede superar el ancho máximo de la impresora.
-                    ancho_final = min(ancho_objetivo, ancho_max_impresora)
-                    
-                    # Redimensionar solo si el ancho final es diferente al original.
-                    if ancho_final != ancho_original:
-                        logger.info(f"Redimensionando imagen. Original: {ancho_original}px, Final: {ancho_final}px.")
-                        ratio = alto_original / float(ancho_original)
-                        alto_final = int(ancho_final * ratio)
-                        
-                        # Usamos Image.Resampling.LANCZOS para mayor calidad en la redimensión
-                        imagen_a_imprimir = imagen_pil.resize((ancho_final, alto_final), Image.Resampling.LANCZOS)
+                    if ancho_deseado is not None:
+                        target = int(ancho_deseado)
                     else:
-                        logger.info(f"Imprimiendo imagen con su ancho original de {ancho_original}px.")
-                        imagen_a_imprimir = imagen_pil
-
-                    impresora_virtual.image(imagen_a_imprimir, impl="bitImageRaster")
-                    logger.info("Imagen procesada para impresión.")
+                        target = ancho_original
                     
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"Error al descargar la imagen: {e}")
+                    ancho_final_contenido = min(target, ancho_seguro_max)
+                    
+                    ratio = alto_original / float(ancho_original)
+                    alto_final_contenido = int(ancho_final_contenido * ratio)
+                    
+                    imagen_redimensionada = imagen_saneada.resize((ancho_final_contenido, alto_final_contenido), Image.Resampling.LANCZOS)
+                    
+                    # 3. Canvas (Padding Blanco)
+                    imagen_canvas = Image.new("RGB", (ancho_canvas, alto_final_contenido), (255, 255, 255))
+                    pos_x = (ancho_canvas - ancho_final_contenido) // 2
+                    imagen_canvas.paste(imagen_redimensionada, (pos_x, 0))
+
+                    # 4. Dither y Streaming
+                    imagen_final = imagen_canvas.convert('1', dither=Image.Dither.FLOYDSTEINBERG)
+                    
+                    CHUNK_HEIGHT = 60
+                    y_pos = 0
+                    
+                    logger.info(f"Enviando contenido de {ancho_final_contenido}px centrado en canvas de {ancho_canvas}px...")
+                    
+                    while y_pos < alto_final_contenido:
+                        bottom = min(y_pos + CHUNK_HEIGHT, alto_final_contenido)
+                        box = (0, y_pos, ancho_canvas, bottom)
+                        fragmento = imagen_final.crop(box)
+                        
+                        chunk_d = Dummy()
+                        chunk_d.image(fragmento, impl="bitImageRaster")
+                        bytes_fragmento = chunk_d.output
+                        
+                        win32print.WritePrinter(hPrinter, bytes_fragmento)
+                        time.sleep(0.15) 
+                        y_pos += CHUNK_HEIGHT
+
+                    # Safety Feed
+                    safety_feed = Dummy()
+                    safety_feed.text("\n") 
+                    win32print.WritePrinter(hPrinter, safety_feed.output)
+                    time.sleep(0.1)
+
                 except Exception as e:
-                    logger.error(f"Error al procesar la imagen: {e}")
+                    logger.error(f"Error procesando imagen: {e}")
 
-        payload_final_bytes = impresora_virtual.output
-        
-        if not payload_final_bytes:
-            raise ValueError("No se generaron comandos de impresión.")
+        bytes_finales = buffer_texto.output
+        if bytes_finales:
+            win32print.WritePrinter(hPrinter, bytes_finales)
 
-        hPrinter = win32print.OpenPrinter(nombre_impresora)
-        try:
-            hJob = win32print.StartDocPrinter(hPrinter, 1, ("Ticket Plugin Flask", None, "RAW"))
-            try:
-                win32print.StartPagePrinter(hPrinter)
-                win32print.WritePrinter(hPrinter, payload_final_bytes)
-                win32print.EndPagePrinter(hPrinter)
-            finally:
-                win32print.EndDocPrinter(hPrinter)
-        finally:
-            win32print.ClosePrinter(hPrinter)
+        win32print.EndPagePrinter(hPrinter)
+        win32print.EndDocPrinter(hPrinter)
+        win32print.ClosePrinter(hPrinter)
         
-        logger.info(f"Impresión enviada correctamente a {nombre_impresora}.")
-        return jsonify({"ok": True, "message": "Operaciones procesadas e impresas correctamente"})
+        logger.info(f"Impresión finalizada en {nombre_impresora}.")
+        return jsonify({"ok": True, "message": "Operaciones enviadas correctamente"})
 
     except Exception as e:
-        logger.error(f"Error durante la impresión: {e}")
+        logger.error(f"Error crítico durante impresión: {e}")
+        try:
+            if hPrinter:
+                win32print.EndPagePrinter(hPrinter)
+                win32print.EndDocPrinter(hPrinter)
+                win32print.ClosePrinter(hPrinter)
+        except:
+            pass
         return jsonify({"ok": False, "message": str(e)}), 500
 
 def run_server():
