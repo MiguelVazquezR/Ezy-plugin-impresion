@@ -64,7 +64,7 @@ jobs:
         run: |
           pyinstaller ezy_plugin_macos.spec --noconfirm
 
-      - name: Verificar arquitecturas (debe mostrar: x86_64 arm64)
+      - name: "Verificar arquitecturas (debe mostrar: x86_64 arm64)"
         run: |
           BIN="dist/ezy_plugin_macos.app/Contents/MacOS/ezy_plugin_macos"
           echo "Arquitecturas: $(lipo -archs "$BIN")"
