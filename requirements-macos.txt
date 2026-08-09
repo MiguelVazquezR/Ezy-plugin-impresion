@@ -1,0 +1,20 @@
+# Dependencias del plugin Ezy de Impresión — macOS
+# Uso:
+#   pip install -r requirements-macos.txt
+#
+# Para el empaquetado con PyInstaller se necesita además:
+#   pip install pyinstaller
+
+Flask>=3.0,<4.0
+flask-cors>=4.0,<5.0
+waitress>=3.0,<4.0
+pystray>=0.19,<0.20
+Pillow>=10.0,<12.0
+python-escpos>=3.0,<4.0
+requests>=2.31,<3.0
+
+# pystray en macOS requiere PyObjC (framework Cocoa) para el ícono de menú.
+pyobjc-framework-Cocoa>=10.0
+
+# Herramienta de empaquetado (genera el .app universal2)
+pyinstaller>=6.0

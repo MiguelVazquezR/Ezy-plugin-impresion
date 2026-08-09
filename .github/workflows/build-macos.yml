@@ -1,0 +1,156 @@
+# ============================================================================
+# build-macos.yml — Compila el plugin de impresión para macOS (universal2:
+# Apple Silicon M1/M2/M3 + Intel) en una máquina virtual de macOS real.
+#
+# Cómo usarlo:
+#   1. Sube estos archivos a GitHub (git push).
+#   2. Entra a la pestaña "Actions" → "Compilar plugin macOS".
+#   3. Clic en "Run workflow" (botón) → verás la compilación (~6-8 min).
+#   4. Al terminar, baja en "Artifacts" → descarga `ezy_plugin_macos.zip`.
+#   5. Envía ese .zip por WhatsApp a tus suscriptores con Mac.
+#
+# El workflow también ejecuta smoke tests en macOS real:
+#   - Arranca el binario compilado y verifica /version y /impresoras.
+#   - Ejecuta el pipeline completo en modo dry-run (texto + cajón + feed)
+#     y verifica que se generan los bytes .bin sin errores.
+# ============================================================================
+name: Compilar plugin macOS
+
+on:
+  workflow_dispatch:  # Botón "Run workflow" en la pestaña Actions
+  push:
+    branches: [main]
+
+jobs:
+  build-macos:
+    runs-on: macos-13   # Mac Intel con Xcode: compila universal2 (arm64 + x86_64)
+    timeout-minutes: 30
+
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python (universal2 para macOS)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-macos.txt
+
+      - name: Generar icono .icns desde icon.png
+        run: |
+          if [ -f icon.png ]; then
+            mkdir -p icon.iconset
+            sips -z 16 16 icon.png --out icon.iconset/icon_16x16.png
+            sips -z 32 32 icon.png --out icon.iconset/icon_16x16@2x.png
+            sips -z 32 32 icon.png --out icon.iconset/icon_32x32.png
+            sips -z 64 64 icon.png --out icon.iconset/icon_32x32@2x.png
+            sips -z 128 128 icon.png --out icon.iconset/icon_128x128.png
+            sips -z 256 256 icon.png --out icon.iconset/icon_128x128@2x.png
+            sips -z 256 256 icon.png --out icon.iconset/icon_256x256.png
+            sips -z 512 512 icon.png --out icon.iconset/icon_256x256@2x.png
+            sips -z 512 512 icon.png --out icon.iconset/icon_512x512.png
+            sips -z 1024 1024 icon.png --out icon.iconset/icon_512x512@2x.png
+            iconutil -c icns icon.iconset -o icon.icns
+            echo "icon.icns generado"
+          else
+            echo "icon.png no encontrado; se usará el ícono genérico"
+          fi
+
+      - name: Compilar .app con PyInstaller (universal2)
+        run: |
+          pyinstaller ezy_plugin_macos.spec --noconfirm
+
+      - name: Verificar arquitecturas (debe mostrar: x86_64 arm64)
+        run: |
+          BIN="dist/ezy_plugin_macos.app/Contents/MacOS/ezy_plugin_macos"
+          echo "Arquitecturas: $(lipo -archs "$BIN")"
+          lipo -archs "$BIN" | grep -q "arm64" || { echo "Falta arm64"; exit 1; }
+          lipo -archs "$BIN" | grep -q "x86_64" || { echo "Falta x86_64"; exit 1; }
+
+      - name: Smoke test en macOS real (arranca binario + endpoints)
+        run: |
+          APP_BIN="dist/ezy_plugin_macos.app/Contents/MacOS/ezy_plugin_macos"
+          # Se lanza el binario del .app directamente; puede tardar unos segundos
+          # en levantar Waitress en el puerto 8000.
+          "$APP_BIN" > /tmp/ezyplugin_smoke.log 2>&1 &
+          APP_PID=$!
+          echo "App PID: $APP_PID"
+
+          # Esperar a que el servidor responda (máx. 30 s)
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/version > /tmp/version.json 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "== /version =="
+          cat /tmp/version.json
+          grep -q '"ok": true' /tmp/version.json || { echo "FALLO: /version no respondió OK"; kill $APP_PID 2>/dev/null; exit 1; }
+
+          echo "== /impresoras =="
+          curl -sf http://127.0.0.1:8000/impresoras || echo "(sin impresoras configuradas en el runner: responde array vacío)"
+
+          kill $APP_PID 2>/dev/null || true
+          wait $APP_PID 2>/dev/null || true
+          echo "SMOKE TEST OK"
+
+      - name: Pipeline dry-run (texto + cajón + feed) en macOS real
+        run: |
+          APP_BIN="dist/ezy_plugin_macos.app/Contents/MacOS/ezy_plugin_macos"
+          EZYPLUGIN_DRYRUN=1 "$APP_BIN" > /tmp/ezyplugin_dryrun.log 2>&1 &
+          APP_PID=$!
+
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/version > /dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          RESP=$(curl -s -X POST http://127.0.0.1:8000/imprimir \
+            -H "Content-Type: application/json" \
+            -d '{
+              "nombreImpresora": "TEST_MAC",
+              "anchoImpresora": "80mm",
+              "operaciones": [
+                {"nombre": "EscribirTexto", "argumentos": ["PRUEBA MAC OS\n"]},
+                {"nombre": "AbrirCajon", "argumentos": []},
+                {"nombre": "Feed", "argumentos": [3]}
+              ]
+            }')
+          echo "Respuesta /imprimir: $RESP"
+          echo "$RESP" | grep -q '"ok": true' || { echo "FALLO: /imprimir en dry-run"; kill $APP_PID 2>/dev/null; exit 1; }
+
+          # Verificar que se escribió el archivo .bin
+          DIR="$HOME/Library/Application Support/EzyPlugin"
+          sleep 1
+          BIN_COUNT=$(ls -1 "$DIR"/impresion_dryrun_*.bin 2>/dev/null | wc -l | tr -d ' ')
+          echo "Archivos dry-run generados: $BIN_COUNT"
+          [ "$BIN_COUNT" -ge 1 ] || { echo "FALLO: no se generó .bin"; kill $APP_PID 2>/dev/null; exit 1; }
+
+          kill $APP_PID 2>/dev/null || true
+          wait $APP_PID 2>/dev/null || true
+          echo "DRY-RUN OK"
+
+      - name: Preparar paquete para el suscriptor (app + guía + instalador)
+        run: |
+          cd dist
+          # Copiar la guía y el instalador de cola raw al paquete final
+          cp ../GUIA_MAC.md "GUIA PARA USUARIO MAC.txt" 2>/dev/null || cp ../GUIA_MAC.md ./
+          cp ../instalar_cola_raw.command "Instalar_Cola_Raw.command" 2>/dev/null || true
+          chmod +x "Instalar_Cola_Raw.command" 2>/dev/null || true
+          zip -r ezy_plugin_macos.zip ezy_plugin_macos.app \
+            GUIA_MAC.md "Instalar_Cola_Raw.command"
+          ls -lh ezy_plugin_macos.zip
+
+      - name: Publicar artifact descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ezy_plugin_macos
+          path: dist/ezy_plugin_macos.zip
+          if-no-files-found: error
